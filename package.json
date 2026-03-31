@@ -1,0 +1,12 @@
+{
+  "name": "claude-memory-store",
+  "version": "1.0.0",
+  "description": "Local SQLite MCP server for cross-session memory",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}
