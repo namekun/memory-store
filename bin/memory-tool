@@ -1,0 +1,132 @@
+#!/usr/bin/env bun
+
+import { Database } from "bun:sqlite";
+import { homedir } from "os";
+import { join } from "path";
+
+const DB_PATH = process.env.MEMORY_STORE_DB_PATH
+  || join(homedir(), ".claude", "mcp-servers", "memory-store", "data", "memory.db");
+
+const db = new Database(DB_PATH, { create: true });
+db.exec("PRAGMA journal_mode=WAL");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS memories (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'general',
+    tags TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  )
+`);
+db.exec("CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)");
+
+const [cmd, ...args] = process.argv.slice(2);
+
+function usage() {
+  console.log(`memory-tool — SQLite memory store CLI
+
+Usage:
+  memory-tool save <key> <value> [--category <cat>] [--tags <tags>]
+  memory-tool get <key>
+  memory-tool search <query> [--category <cat>] [--limit <n>]
+  memory-tool list [category]
+  memory-tool delete <key>
+  memory-tool stats`);
+  process.exit(1);
+}
+
+function parseFlags(args: string[]): { positional: string[]; flags: Record<string, string> } {
+  const positional: string[] = [];
+  const flags: Record<string, string> = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith("--") && i + 1 < args.length) {
+      flags[args[i].slice(2)] = args[++i];
+    } else {
+      positional.push(args[i]);
+    }
+  }
+  return { positional, flags };
+}
+
+const { positional, flags } = parseFlags(args);
+
+switch (cmd) {
+  case "save": {
+    const [key, ...valueParts] = positional;
+    let value = valueParts.join(" ");
+    if (!key) { console.error("Error: key required"); usage(); }
+    // Read from stdin if no value provided
+    if (!value) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of Bun.stdin.stream()) {
+        chunks.push(Buffer.from(chunk));
+      }
+      value = Buffer.concat(chunks).toString().trim();
+    }
+    if (!value) { console.error("Error: value required"); usage(); }
+    const category = flags.category || "general";
+    const tags = flags.tags || "";
+    db.prepare(`
+      INSERT INTO memories (key, value, category, tags, created_at, updated_at)
+      VALUES (?, ?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value, category = excluded.category,
+        tags = excluded.tags, updated_at = datetime('now', 'localtime')
+    `).run(key, value, category, tags);
+    console.log(`Saved: ${key} [${category}]`);
+    break;
+  }
+  case "get": {
+    const [key] = positional;
+    if (!key) { console.error("Error: key required"); usage(); }
+    const row = db.prepare("SELECT * FROM memories WHERE key = ?").get(key) as any;
+    if (!row) { console.log(`Not found: ${key}`); break; }
+    console.log(JSON.stringify(row, null, 2));
+    break;
+  }
+  case "search": {
+    const [query] = positional;
+    if (!query) { console.error("Error: query required"); usage(); }
+    const pattern = `%${query}%`;
+    const limit = parseInt(flags.limit || "20");
+    let sql = "SELECT key, category, tags, updated_at, substr(value, 1, 200) as preview FROM memories WHERE (key LIKE ? OR value LIKE ? OR tags LIKE ?)";
+    const params: any[] = [pattern, pattern, pattern];
+    if (flags.category) { sql += " AND category = ?"; params.push(flags.category); }
+    sql += " ORDER BY updated_at DESC LIMIT ?";
+    params.push(limit);
+    const rows = db.prepare(sql).all(...params) as any[];
+    if (rows.length === 0) { console.log(`No results for: ${query}`); break; }
+    console.log(JSON.stringify(rows, null, 2));
+    break;
+  }
+  case "list": {
+    const [category] = positional;
+    if (!category) {
+      const rows = db.prepare("SELECT category, COUNT(*) as count, MAX(updated_at) as last_updated FROM memories GROUP BY category ORDER BY last_updated DESC").all();
+      const total = db.prepare("SELECT COUNT(*) as count FROM memories").get() as any;
+      console.log(`Total: ${total.count} memories\n`);
+      console.log(JSON.stringify(rows, null, 2));
+    } else {
+      const rows = db.prepare("SELECT key, tags, updated_at, substr(value, 1, 100) as preview FROM memories WHERE category = ? ORDER BY updated_at DESC LIMIT 50").all(category);
+      console.log(JSON.stringify(rows, null, 2));
+    }
+    break;
+  }
+  case "delete": {
+    const [key] = positional;
+    if (!key) { console.error("Error: key required"); usage(); }
+    const result = db.prepare("DELETE FROM memories WHERE key = ?").run(key);
+    console.log(result.changes > 0 ? `Deleted: ${key}` : `Not found: ${key}`);
+    break;
+  }
+  case "stats": {
+    const total = db.prepare("SELECT COUNT(*) as count FROM memories").get() as any;
+    const categories = db.prepare("SELECT category, COUNT(*) as count FROM memories GROUP BY category").all();
+    const recent = db.prepare("SELECT key, category, updated_at FROM memories ORDER BY updated_at DESC LIMIT 5").all();
+    console.log(JSON.stringify({ total: total.count, categories, recent }, null, 2));
+    break;
+  }
+  default:
+    usage();
+}
